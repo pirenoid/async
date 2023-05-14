@@ -7,6 +7,14 @@ import (
 	"sync"
 )
 
+const th = 6
+
+func pipeline(in chan interface{}, out chan interface{}, j job, wg *sync.WaitGroup) {
+	defer wg.Done()
+	defer close(out)
+	j(in, out)
+}
+
 func ExecutePipeline(jobs ...job) {
 	wg := &sync.WaitGroup{}
 	in := make(chan interface{})
@@ -14,15 +22,35 @@ func ExecutePipeline(jobs ...job) {
 
 	for _, j := range jobs {
 		wg.Add(1)
-		go func(in chan interface{}, out chan interface{}, j job) {
-			defer wg.Done()
-			defer close(out)
-			j(in, out)
-		}(in, out, j)
+		go pipeline(in, out, j, wg)
 		in = out
 		out = make(chan interface{})
 	}
 	wg.Wait()
+}
+
+func makeCrc32Md5(crc32Md5Chan chan string, data string, wg *sync.WaitGroup, m *sync.Mutex) {
+	defer wg.Done()
+	m.Lock()
+	md5 := DataSignerMd5(data)
+	m.Unlock()
+	crc32Md5 := DataSignerCrc32(md5)
+
+	crc32Md5Chan <- crc32Md5
+}
+
+func makeCrc32(crc32Chan chan string, data string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	crc32 := DataSignerCrc32(data)
+	crc32Chan <- crc32
+}
+
+func resultSingleHash(crc32Chan, crc32Md5Chan chan string, out chan interface{}, wg *sync.WaitGroup) {
+	defer wg.Done()
+	crc32 := <-crc32Chan
+	crc32Md5 := <-crc32Md5Chan
+	res := crc32 + "~" + crc32Md5
+	out <- res
 }
 
 func SingleHash(in, out chan interface{}) {
@@ -37,45 +65,41 @@ func SingleHash(in, out chan interface{}) {
 			data = s.(string)
 		}
 
-		// crc32(data)+"~"+crc32(md5(data))
-
 		// crc32(md5(data))
 		crc32Md5Chan := make(chan string, 1)
 		wg.Add(1)
-		go func(crc32Md5Chan chan string, data string) {
-			defer wg.Done()
-			m.Lock()
-			md5 := DataSignerMd5(data)
-			m.Unlock()
-			crc32Md5 := DataSignerCrc32(md5)
-
-			crc32Md5Chan <- crc32Md5
-		}(crc32Md5Chan, data)
+		go makeCrc32Md5(crc32Md5Chan, data, wg, m)
 
 		// crc32(data)
-
 		wg.Add(1)
 		crc32Chan := make(chan string, 1)
-		go func(crc32Chan chan string, data string) {
-			defer wg.Done()
-			crc32 := DataSignerCrc32(data)
-			crc32Chan <- crc32
-		}(crc32Chan, data)
+		go makeCrc32(crc32Chan, data, wg)
 
+		// crc32(data)+"~"+crc32(md5(data))
 		wg.Add(1)
-		go func(crc32Chan, crc32Md5Chan chan string, out chan interface{}) {
-			defer wg.Done()
-			crc32 := <-crc32Chan
-			crc32Md5 := <-crc32Md5Chan
-			res := crc32 + "~" + crc32Md5
-			out <- res
-		}(crc32Chan, crc32Md5Chan, out)
+		go resultSingleHash(crc32Chan, crc32Md5Chan, out, wg)
 	}
 
 	wg.Wait()
 }
 
-// crc32(th+data)
+func crc32MultiHash(data string, i int, wgMH *sync.WaitGroup, m *sync.Mutex, result []string) {
+	defer wgMH.Done()
+	crc32 := DataSignerCrc32(strconv.Itoa(i) + data)
+	m.Lock()
+	result[i] = crc32
+	m.Unlock()
+}
+
+func resultMultiHash(out chan interface{}, wg *sync.WaitGroup, wgMH *sync.WaitGroup, result []string) {
+	defer wg.Done()
+	wgMH.Wait()
+	resString := ""
+	for i := 0; i < th; i++ {
+		resString += result[i]
+	}
+	out <- resString
+}
 
 func MultiHash(in, out chan interface{}) {
 	wg := &sync.WaitGroup{}
@@ -92,27 +116,14 @@ func MultiHash(in, out chan interface{}) {
 		result := make([]string, 6)
 		m := &sync.Mutex{}
 
+		// crc32(th+data)
 		for i := 0; i < 6; i++ {
 			wgMH.Add(1)
-			go func(data string, i int) {
-				defer wgMH.Done()
-				crc32 := DataSignerCrc32(strconv.Itoa(i) + data)
-				m.Lock()
-				result[i] = crc32
-				m.Unlock()
-			}(data, i)
+			go crc32MultiHash(data, i, wgMH, m, result)
 		}
 
 		wg.Add(1)
-		go func(out chan interface{}) {
-			defer wg.Done()
-			wgMH.Wait()
-			resString := ""
-			for i := 0; i < 6; i++ {
-				resString += result[i]
-			}
-			out <- resString
-		}(out)
+		go resultMultiHash(out, wg, wgMH, result)
 	}
 
 	wg.Wait()
